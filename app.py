@@ -8,7 +8,7 @@ import random
 st.set_page_config(page_title="출결신고서 통합 HWPX 생성기", layout="wide")
 
 st.title("📄 출결신고서 통합 HWPX 자동 생성기")
-st.markdown("나이스 엑셀을 업로드하면 기존 매크로 로직으로 가공하여 **완벽한 서식의 단일 HWPX 파일**로 합쳐서 생성합니다.")
+st.markdown("나이스 엑셀을 업로드하면 기존 매크로 로직으로 가공하여 **오류 없이 완벽한 단일 HWPX 파일**로 합쳐서 생성합니다.")
 
 # 1. 파일 업로드 UI
 col1, col2 = st.columns(2)
@@ -20,7 +20,7 @@ with col1:
 
 with col2:
     st.subheader("2. 한글 양식 업로드")
-    st.info("🚨 템플릿 HWPX 내에 {{성명}}, {{사유}} 등의 태그가 정상적으로 존재해야 합니다.")
+    st.info("💡 템플릿 파일 내에 {{성명}}, {{사유}} 등 중괄호로 채워진 태그가 정상적으로 존재해야 합니다.")
     template_file = st.file_uploader("HWPX 템플릿 파일 업로드", type=['hwpx'])
 
 # 2. VBA 로직 이식 데이터 가공 함수
@@ -94,7 +94,7 @@ def process_data_vba(df, g, c):
             "selected": True
         })
     
-    # VBA와 동일하게 번호 -> 월 -> 일 순으로 정렬
+    # VBA와 동일하게 번호 -> 월 -> 일 순으로 오름차순 정렬
     processed.sort(key=lambda x: (x["_sort_num"], x["_sort_m"], x["_sort_d"]))
     return processed
 
@@ -103,14 +103,17 @@ def build_integrated_hwpx(template_bytes, data_list):
     with zipfile.ZipFile(io.BytesIO(template_bytes), 'r') as zin:
         zip_files = {item.filename: zin.read(item.filename) for item in zin.infolist()}
     
-    # 본문 데이터 로드
     section_path = 'Contents/section0.xml'
     if section_path not in zip_files:
         raise ValueError("올바른 HWPX 서식이 아닙니다.")
         
     origin_xml = zip_files[section_path].decode('utf-8')
     
-    # 한글 문서 내부 섹션 틀 분리 구문 자동 파싱
+    # [핵심 보완 1] 한글 프로그램이 내부에서 쪼개놓은 중괄호 태그 전처리 정상화
+    origin_xml = re.sub(r'\{<[^>]+>\{', '{{', origin_xml)
+    origin_xml = re.sub(r'\}<[^>]+>\}', '}}', origin_xml)
+    
+    # 섹션 본문 영역 파싱
     sec_match = re.search(r'(<hs:sec[^>]*>)(.*?)(</hs:sec>)', origin_xml, re.DOTALL)
     if not sec_match:
         raise ValueError("HWPX 내부 구문을 분석할 수 없습니다.")
@@ -124,29 +127,27 @@ def build_integrated_hwpx(template_bytes, data_list):
     for idx, student in enumerate(data_list):
         page_xml = body_template
         
-        # 태그 치환 진행 (VBA 헤더 규칙 기반)
+        # 데이터 치환
         for tag, value in student.items():
             if tag.startswith('{{'):
                 page_xml = page_xml.replace(tag, value)
         
-        # 내부 엘리먼트 고유 ID 난수화하여 한글 프로그램 내 충돌 및 파일 깨짐 원천 차단
-        def rand_id(m):
-            return f' id="{random.randint(100000, 9999999)}"'
-        page_xml = re.sub(r' id="\d+"', rand_id, page_xml)
+        # [핵심 보완 2] 완전히 무작위 변환 대신 일정한 오프셋을 더해 표 내부 상대참조 유지 (크래시 해결)
+        offset = (idx + 1) * 50000
+        def shift_id(m):
+            id_val = int(m.group(1))
+            return f' id="{id_val + offset}"'
+        page_xml = re.sub(r' id="(\d+)"', shift_id, page_xml)
         
-        # 페이지 간의 자동 구분을 위해 매 페이지 끝에 한글 전용 구획 추가
+        # [핵심 보완 3] 단 나누기(colBr) 대신 정식 쪽 나누기(pageBr) 문단을 끝에 추가
         if idx < len(data_list) - 1:
-            # 마지막 페이지가 아닐 때만 한글 인쇄용 강제 쪽나누기 태그 삽입
-            if "</hp:p>" in page_xml:
-                page_xml = page_xml.rstrip().replace("</hp:p>", "</hp:p><hp:p><hp:run><hp:ctrl><hc:colBr/></hp:ctrl></hp:run></hp:p>", 1)
+            page_xml += "<hp:p><hp:run><hp:ctrl><hc:pageBr/></hp:ctrl></hp:run></hp:p>"
                 
         merged_bodies.append(page_xml)
         
-    # 재조립 진행
     final_xml = prefix + "".join(merged_bodies) + suffix
     zip_files[section_path] = final_xml.encode('utf-8')
     
-    # ZIP 포맷 재압축 및 바이너리 출력
     out_io = io.BytesIO()
     with zipfile.ZipFile(out_io, 'w', zipfile.ZIP_DEFLATED) as zout:
         for fpath, fdata in zip_files.items():
@@ -171,7 +172,6 @@ if excel_file and template_file:
         view_cols = ['selected', '{{시작일_월}}', '{{시작일_일}}', '{{번호}}', '{{성명}}', '{{출결구분_원본}}', '{{사유}}']
         edited_df = st.data_editor(display_df[view_cols], hide_index=True)
         
-        # 최종 선택된 학생 필터링
         selected_students = [st.session_state.attendance_records[i] for i, r in edited_df.iterrows() if r['selected']]
         
         if st.button("🔥 1개의 HWPX 파일로 최종 결과물 통합 생성하기", type="primary"):
